@@ -1,6 +1,12 @@
-# ElevenLabs TTS API Proxy
+# Chat-to-Voice API
 
-A secure Node.js/Express backend that proxies text-to-speech requests to the ElevenLabs API.
+A Node.js/Express backend that combines Gemini AI for conversational responses with ElevenLabs TTS for voice output.
+
+## Flow
+
+```
+User Text → Gemini AI → Response Text → ElevenLabs TTS → Audio Stream
+```
 
 ## Setup
 
@@ -9,14 +15,15 @@ A secure Node.js/Express backend that proxies text-to-speech requests to the Ele
    npm install
    ```
 
-2. Create a `.env` file from the template:
+2. Create a `.env` file:
    ```bash
    cp .env.example .env
    ```
 
-3. Add your ElevenLabs API key to `.env`:
+3. Add your API keys to `.env`:
    ```
-   ELEVENLABS_API_KEY=your_actual_api_key
+   GEMINI_API_KEY=your_gemini_key
+   ELEVENLABS_API_KEY=your_elevenlabs_key
    ```
 
 4. Start the server:
@@ -26,28 +33,34 @@ A secure Node.js/Express backend that proxies text-to-speech requests to the Ele
 
 ## API Endpoints
 
-### POST /generate-audio
+### POST /chat
 
-Generates speech audio from text.
+Send text, receive AI-generated voice response.
 
 **Request:**
 ```json
 {
-  "text": "Hello, this is a test message."
+  "text": "Tell me a joke"
 }
 ```
 
 **Response:** Audio stream (audio/mpeg)
 
+The Gemini text response is included in the `X-Gemini-Response` header (base64 encoded).
+
 ### GET /health
 
-Health check endpoint.
+Health check with service status.
 
 **Response:**
 ```json
 {
   "status": "ok",
-  "timestamp": "2024-12-15T22:00:00.000Z"
+  "timestamp": "2024-12-16T18:00:00.000Z",
+  "services": {
+    "gemini": true,
+    "elevenlabs": true
+  }
 }
 ```
 
@@ -55,5 +68,15 @@ Health check endpoint.
 
 | Variable | Description |
 |----------|-------------|
-| `ELEVENLABS_API_KEY` | Your ElevenLabs API key (required) |
+| `GEMINI_API_KEY` | Google Gemini API key (required) |
+| `ELEVENLABS_API_KEY` | ElevenLabs API key (required) |
 | `PORT` | Server port (default: 3000) |
+
+## Test
+
+```bash
+curl -X POST http://localhost:3000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello, how are you?"}' \
+  --output response.mp3
+```
