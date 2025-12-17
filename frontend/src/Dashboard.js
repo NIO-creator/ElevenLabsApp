@@ -168,15 +168,12 @@ const Dashboard = ({ user, onLogout }) => {
             setAutoplayBlocked(false);
             setIsSpeaking(false);
 
-            // Get auth token for authenticated request
-            const token = tokenManager.getToken();
-
-            const response = await fetch(`${API_BASE_URL}/chat`, {
+            // ─────────────────────────────────────────────────────────────
+            // AUTHENTICATED POST REQUEST to /chat endpoint
+            // Using authFetch wrapper to ensure proper method and headers
+            // ─────────────────────────────────────────────────────────────
+            const response = await authFetch(API_CONFIG.ENDPOINTS.CHAT, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(token && { 'Authorization': `Bearer ${token}` }),
-                },
                 body: JSON.stringify({ text: text.trim() }),
             });
 

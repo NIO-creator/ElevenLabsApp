@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // Voice ID for ElevenLabs TTS (Custom Jarvis Voice)
-const VOICE_ID = '5hGpSLvZpoxzzDG94isP';
+const VOICE_ID = '5b8aKJE8sNdJ9UbP8jBp'; // J.A.R.V.I.S. voice
 
 // Global variable to store the temp user's ObjectId
 global.tempUserId = null;
