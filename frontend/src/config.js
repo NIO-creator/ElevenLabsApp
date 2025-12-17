@@ -17,8 +17,8 @@ const IS_PRODUCTION = ENV === 'production';
 // API CONFIGURATION - HARDENED BACKEND v11.0
 // ═══════════════════════════════════════════════════════════════════════════
 export const API_CONFIG = {
-    // Production backend URL (hardened, requires Bearer token)
-    BASE_URL: 'https://ai-vibe-coder-proxy-227166991308.europe-west1.run.app',
+    // Production backend URL - GCP Project 794024916030 (v11.2)
+    BASE_URL: 'https://ai-vibe-coder-proxy-794024916030.europe-west1.run.app',
 
     // API Endpoints
     ENDPOINTS: {
