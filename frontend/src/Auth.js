@@ -11,59 +11,11 @@ import { API_CONFIG, tokenManager, audioManager } from './config';
  * @param {Function} onAuthSuccess - Callback fired on successful authentication with user data
  */
 
-// Re-export tokenManager for backward compatibility with Dashboard imports
-export { tokenManager } from './config';
+// Re-export tokenManager and authFetch for backward compatibility
+export { tokenManager, authFetch } from './config';
 
 // Production API Base URL from centralized config
 const API_BASE_URL = API_CONFIG.BASE_URL;
-
-// Token storage keys
-const TOKEN_KEY = 'starkAuthToken';
-const USER_KEY = 'starkUser';
-
-/**
- * Token Management Utility Functions
- * These can be imported by other components or moved to a separate api.js file
- */
-export const tokenManager = {
-    getToken: () => localStorage.getItem(TOKEN_KEY),
-    getUser: () => {
-        const user = localStorage.getItem(USER_KEY);
-        return user ? JSON.parse(user) : null;
-    },
-    setAuth: (token, user) => {
-        localStorage.setItem(TOKEN_KEY, token);
-        localStorage.setItem(USER_KEY, JSON.stringify(user));
-    },
-    clearAuth: () => {
-        localStorage.removeItem(TOKEN_KEY);
-        localStorage.removeItem(USER_KEY);
-    },
-    isAuthenticated: () => !!localStorage.getItem(TOKEN_KEY)
-};
-
-/**
- * Fetch wrapper with Authorization header
- * Use this for authenticated API calls
- */
-export const authFetch = async (url, options = {}) => {
-    const token = tokenManager.getToken();
-    const headers = {
-        'Content-Type': 'application/json',
-        ...(token && { Authorization: `Bearer ${token}` }),
-        ...options.headers,
-    };
-
-    const response = await fetch(url, { ...options, headers });
-
-    // Handle 401 - token expired or invalid
-    if (response.status === 401) {
-        tokenManager.clearAuth();
-        window.location.reload(); // Force re-auth
-    }
-
-    return response;
-};
 
 const Auth = ({ onAuthSuccess }) => {
     // ═══════════════════════════════════════════════════════════════
