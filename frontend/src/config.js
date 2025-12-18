@@ -31,8 +31,8 @@ export const API_CONFIG = {
         CHAT: '/chat',
     },
 
-    // Request timeout (ms)
-    TIMEOUT: 30000,
+    // Request timeout (ms) - Increased for v11.3 failover support
+    TIMEOUT: 60000,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -181,7 +181,47 @@ const Dashboard = ({ user, onLogout }) => {
                 throw new Error(`Server error: ${response.status}`);
             }
 
-            // Extract Gemini response from header (Base64 encoded)
+            // ─────────────────────────────────────────────────────────────
+            // RESPONSE HANDLING (Audio vs JSON Failover) - v11.3
+            // ─────────────────────────────────────────────────────────────
+            const contentType = response.headers.get('content-type');
+
+            // Check for JSON response (Audio Generation Failed / Text-Only)
+            if (contentType && contentType.includes('application/json')) {
+                const data = await response.json();
+
+                // Add assistant message (text-only)
+                const assistantMessage = {
+                    id: Date.now() + 1,
+                    role: 'assistant',
+                    content: data.text || 'Received empty response',
+                    timestamp: new Date()
+                };
+                setMessages(prev => [...prev, assistantMessage]);
+
+                // Handle Audio Failure Flag
+                if (data.audioFailed) {
+                    console.warn('⚠️ Audio generation failed - Fallback to Text Mode');
+
+                    // Trigger System Notification
+                    const systemNotification = {
+                        id: Date.now() + 2,
+                        role: 'system',
+                        content: '⚠️ Voice System Offline - Text Mode Active',
+                        timestamp: new Date()
+                    };
+                    setMessages(prev => [...prev, systemNotification]);
+                }
+
+                setIsLoading(false);
+                return; // processing complete, no audio to play
+            }
+
+            // ─────────────────────────────────────────────────────────────
+            // AUDIO RESPONSE HANDLING (Standard Flow)
+            // ─────────────────────────────────────────────────────────────
+
+            // Extract Gemini response from header (Base64 encoded) for audio streams
             const geminiResponseBase64 = response.headers.get('X-Gemini-Response');
             let assistantText = 'Audio response received';
 
@@ -202,39 +242,31 @@ const Dashboard = ({ user, onLogout }) => {
 
             setMessages(prev => [...prev, assistantMessage]);
 
-            // ─────────────────────────────────────────────────────────────
-            // BINARY STREAM HANDLING: Process audio/mpeg blob
-            // ─────────────────────────────────────────────────────────────
+            // Process audio blob
             const arrayBuffer = await response.arrayBuffer();
             const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
             const blobUrl = URL.createObjectURL(blob);
             blobUrlRef.current = blobUrl;
 
-            // Create new Audio element and assign to ref
             const audio = new Audio(blobUrl);
             audioRef.current = audio;
 
-            // ─────────────────────────────────────────────────────────────
-            // AUTOPLAY RESILIENCE: Handle browser autoplay restrictions
-            // ─────────────────────────────────────────────────────────────
+            // Autoplay handling
             try {
                 await audio.play();
             } catch (playError) {
-                // Handle autoplay restrictions gracefully
                 if (playError.name === 'NotAllowedError') {
-                    console.warn('Autoplay blocked by browser. User interaction required.');
+                    console.warn('Autoplay blocked. User interaction required.');
                     setAutoplayBlocked(true);
 
-                    // Add system message to HUD alerting user
                     const autoplayWarning = {
                         id: Date.now() + 2,
                         role: 'system',
-                        content: '⚠️ Audio autoplay blocked by browser. Click the play button or interact with the page to enable audio.',
+                        content: '⚠️ Audio autoplay blocked. Click to enable audio.',
                         timestamp: new Date()
                     };
                     setMessages(prev => [...prev, autoplayWarning]);
                 } else {
-                    // Re-throw if it's a different error
                     throw playError;
                 }
             }

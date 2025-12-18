@@ -323,7 +323,7 @@ const Auth = ({ onAuthSuccess }) => {
                                 autoComplete={isLoginMode ? "current-password" : "new-password"}
                                 className="w-full bg-gray-800/60 border border-cyan-500/30 rounded-lg px-4 py-3.5 text-cyan-100 placeholder-gray-500 focus:outline-none focus:border-cyan-400 focus:shadow-[0_0_15px_rgba(34,211,238,0.3)] transition-all duration-300 tracking-wide disabled:opacity-40"
                             />
-                            <p className="text-gray-500 text-xs mt-2 tracking-wide">Minimum 6 characters</p>
+                            <p className="text-gray-500 text-xs mt-2 tracking-wide">New 6-character password minimum</p>
                         </div>
 
                         {/* Confirm Password (Register) */}

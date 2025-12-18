@@ -145,6 +145,9 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Favicon Fix - Stop 404 noise
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 // Security Headers (helmet)
 app.use(helmet({
     contentSecurityPolicy: {
@@ -290,9 +293,9 @@ app.post('/api/auth/register', async (req, res) => {
             );
         }
 
-        if (password.length < 8) {
+        if (password.length < 6) {
             return res.status(400).json(
-                createErrorResponse(400, 'Bad Request', 'Password must be at least 8 characters')
+                createErrorResponse(400, 'Bad Request', 'Password must be at least 6 characters')
             );
         }
 
@@ -569,13 +572,18 @@ app.post('/chat', verifyToken, chatLimiter, async (req, res) => {
             }
         }
 
-        // Step 4: Send Gemini response to ElevenLabs TTS
-        console.log('🎤 Calling ElevenLabs TTS API...');
+        // Step 4: Send Gemini response to ElevenLabs TTS with Circuit Breaker
+        console.log('DEBUG: Initiating ElevenLabs TTS call...');
         const elevenLabsUrl = `https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`;
 
-        let ttsResponse;
         try {
-            ttsResponse = await fetch(elevenLabsUrl, {
+            // Create a timeout promise (25 seconds)
+            const timeoutPromise = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('ElevenLabs API timeout')), 25000)
+            );
+
+            // Fetch promise
+            const fetchPromise = fetch(elevenLabsUrl, {
                 method: 'POST',
                 headers: {
                     'Accept': 'audio/mpeg',
@@ -591,75 +599,41 @@ app.post('/chat', verifyToken, chatLimiter, async (req, res) => {
                     }
                 })
             });
-        } catch (fetchError) {
-            console.error('ElevenLabs fetch error:', fetchError.message);
-            return res.status(502).json(
-                createErrorResponse(502, 'Bad Gateway', 'Failed to connect to ElevenLabs TTS service', fetchError.message)
-            );
-        }
 
-        // ROBUST ERROR HANDLING: Check for HTTP error status codes (400-599)
-        if (ttsResponse.status >= 400 && ttsResponse.status <= 599) {
-            let errorDetails;
-            try {
-                errorDetails = await ttsResponse.text();
-                try {
-                    errorDetails = JSON.parse(errorDetails);
-                } catch (e) {
-                    // Keep as string if not valid JSON
-                }
-            } catch (e) {
-                errorDetails = 'Unable to read error details';
+            // Race against timeout
+            const ttsResponse = await Promise.race([fetchPromise, timeoutPromise]);
+
+            // Handle ElevenLabs API errors
+            if (!ttsResponse.ok) {
+                const errorText = await ttsResponse.text();
+                throw new Error(`ElevenLabs API returned status ${ttsResponse.status}: ${errorText}`);
             }
 
-            console.error(`❌ ElevenLabs API error [${ttsResponse.status}]:`, errorDetails);
+            // Step 5: Stream the audio response directly to client
+            console.log('🔊 Streaming audio response...');
+            res.set({
+                'Content-Type': 'audio/mpeg',
+                'Transfer-Encoding': 'chunked',
+                'Cache-Control': 'no-cache',
+                'X-Gemini-Response': Buffer.from(responseText.substring(0, 200)).toString('base64')
+            });
 
-            // Map specific status codes to descriptive errors
-            let errorType, errorMessage;
-            switch (ttsResponse.status) {
-                case 401:
-                    errorType = 'Unauthorized';
-                    errorMessage = 'Invalid ElevenLabs API key. Please check your credentials.';
-                    break;
-                case 403:
-                    errorType = 'Forbidden';
-                    errorMessage = 'Access denied. Your API key may not have permission for this voice or feature.';
-                    break;
-                case 404:
-                    errorType = 'Not Found';
-                    errorMessage = 'The specified voice ID was not found.';
-                    break;
-                case 429:
-                    errorType = 'Rate Limited';
-                    errorMessage = 'Too many requests. Please try again later.';
-                    break;
-                case 500:
-                case 502:
-                case 503:
-                case 504:
-                    errorType = 'TTS Service Error';
-                    errorMessage = 'ElevenLabs service is temporarily unavailable. Please try again later.';
-                    break;
-                default:
-                    errorType = 'TTS API Error';
-                    errorMessage = `ElevenLabs API returned status ${ttsResponse.status}`;
-            }
+            ttsResponse.body.pipe(res);
 
-            return res.status(ttsResponse.status).json(
-                createErrorResponse(ttsResponse.status, errorType, errorMessage, errorDetails)
-            );
+        } catch (voiceError) {
+            console.error('❌ Voice Synthesis Failed (Circuit Breaker):', voiceError.message);
+
+            // Text-Only Fallback
+            console.log('📝 Returning Text-Only fallback...');
+
+            // Return 200 OK but with JSON body (client handles mixed content types?)
+            // Or better, standard JSON success with a flag as requested.
+            res.status(200).json({
+                text: responseText,
+                audioFailed: true,
+                error: voiceError.message
+            });
         }
-
-        // Step 5: Stream the audio response directly to client
-        console.log('🔊 Streaming audio response...');
-        res.set({
-            'Content-Type': 'audio/mpeg',
-            'Transfer-Encoding': 'chunked',
-            'Cache-Control': 'no-cache',
-            'X-Gemini-Response': Buffer.from(responseText.substring(0, 200)).toString('base64')
-        });
-
-        ttsResponse.body.pipe(res);
 
     } catch (error) {
         // Catch-all for any unexpected errors
