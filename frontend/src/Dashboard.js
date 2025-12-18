@@ -14,7 +14,7 @@ import VoiceHandler from './VoiceHandler';
  */
 
 // WebSocket Relay Server for Realtime Audio
-const RELAY_SERVER_URL = 'ws://localhost:8081';
+const RELAY_SERVER_URL = 'wss://jarvis-relay-794024916030.europe-west1.run.app';
 
 // Production API Base URL from centralized config
 const API_BASE_URL = API_CONFIG.BASE_URL;

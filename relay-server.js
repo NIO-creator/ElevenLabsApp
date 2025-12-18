@@ -15,7 +15,12 @@
 
 require('dotenv').config();
 const WebSocket = require('ws');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+// Generate UUID v4 without external dependency (ESM compatibility)
+function uuidv4() {
+    return crypto.randomUUID();
+}
 
 // Configuration - Cloud Run uses PORT, fallback to RELAY_PORT for local dev
 const PORT = process.env.PORT || process.env.RELAY_PORT || 8080;
