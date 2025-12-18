@@ -303,11 +303,21 @@ Operational Guidelines:
                 console.error(`❌ [${sessionId}] OpenAI error:`, message.error);
             }
 
-            // T1: Speech stopped - user finished speaking
+            // T1: Speech stopped - user finished speaking - VOCAL HANDSHAKE TRIGGER
             if (message.type === 'input_audio_buffer.speech_stopped') {
                 resetLatencyTracking();
                 latencyMetrics.t1SpeechStopped = process.hrtime();
-                console.log(`🎙️ [${sessionId}] T1: Speech stopped detected`);
+                console.log(`🎙️ [${sessionId}] Speech ended. Forcing J.A.R.V.I.S. response...`);
+
+                // Immediately trigger response generation
+                openaiWs.send(JSON.stringify({
+                    type: 'response.create',
+                    response: {
+                        modalities: ['text'],
+                        instructions: JARVIS_SYSTEM_INSTRUCTIONS // Re-affirm persona
+                    }
+                }));
+                console.log(`📤 Triggering Response [${sessionId}]`);
             }
 
             // Intercept text responses for ElevenLabs

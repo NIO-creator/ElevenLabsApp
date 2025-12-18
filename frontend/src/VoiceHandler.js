@@ -17,7 +17,7 @@ import React, { useState, useRef, useCallback, useEffect, forwardRef, useImperat
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
-const RELAY_SERVER_URL = 'wss://jarvis-relay-794024916030.europe-west1.run.app';
+const RELAY_SERVER_URL = 'wss://elevenlabs-relay-794024916030.europe-west1.run.app';
 const SAMPLE_RATE = 24000; // 24kHz as required by OpenAI
 const CHANNELS = 1;        // Mono
 
