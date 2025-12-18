@@ -1,0 +1,35 @@
+# Dependencies
+node_modules
+npm-debug.log*
+
+# Frontend (not needed for relay server)
+frontend/
+frontend/node_modules
+
+# Development files
+.env
+.env.local
+*.log
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# IDE
+.vscode
+.idea
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+Dockerfile.*
+docker-compose*.yml
+
+# Models (if using SQLite locally)
+*.db
+*.sqlite

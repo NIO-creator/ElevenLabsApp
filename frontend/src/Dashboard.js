@@ -1,16 +1,20 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { API_CONFIG, tokenManager, authFetch } from './config';
+import VoiceHandler from './VoiceHandler';
 
 /**
- * Dashboard Component - Iron Man HUD Interface (v11.0 Production)
+ * Dashboard Component - Iron Man HUD Interface (v12.2 Vocal Link)
  * 
  * The primary command center for interacting with Jarvis AI.
+ * Features real-time WebSocket audio streaming via VoiceHandler.
  * Integrated with hardened Cloud Run backend with JWT authentication.
- * Uses centralized config for API endpoints and auth management.
  * 
  * @param {Object} user - Authenticated user object from Auth component
  * @param {Function} onLogout - Callback to handle user logout
  */
+
+// WebSocket Relay Server for Realtime Audio
+const RELAY_SERVER_URL = 'ws://localhost:8081';
 
 // Production API Base URL from centralized config
 const API_BASE_URL = API_CONFIG.BASE_URL;
@@ -25,6 +29,7 @@ const Dashboard = ({ user, onLogout }) => {
     const [isListening, setIsListening] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
     const [autoplayBlocked, setAutoplayBlocked] = useState(false);
+    const [audioEnabled, setAudioEnabled] = useState(false); // v12.3.1 - Track audio permission
     const [currentTime, setCurrentTime] = useState(new Date());
     const [systemMetrics, setSystemMetrics] = useState({
         cpu: 23,
@@ -33,10 +38,21 @@ const Dashboard = ({ user, onLogout }) => {
         power: 100
     });
 
+    // ═══════════════════════════════════════════════════════════════
+    // VOCAL LINK STATE (v12.2)
+    // ═══════════════════════════════════════════════════════════════
+    const [vocalLinkEnabled, setVocalLinkEnabled] = useState(false);
+    const [vocalLinkStatus, setVocalLinkStatus] = useState(null);
+    const [streamingText, setStreamingText] = useState('');
+    const [audioIntensity, setAudioIntensity] = useState(0);
+
     // Refs
     const messagesEndRef = useRef(null);
     const audioRef = useRef(null);
     const blobUrlRef = useRef(null);
+    const voiceHandlerRef = useRef(null);
+    const streamingMessageIdRef = useRef(null);
+    const audioEnabledRef = useRef(false); // Track if user has enabled audio
 
     // ═══════════════════════════════════════════════════════════════
     // EFFECTS
@@ -77,6 +93,197 @@ const Dashboard = ({ user, onLogout }) => {
             }
         };
     }, []);
+
+    // ═══════════════════════════════════════════════════════════════
+    // GLOBAL JARVIS VOICE TEST FUNCTION (v12.3.1)
+    // ═══════════════════════════════════════════════════════════════
+    useEffect(() => {
+        /**
+         * Manual voice test function - accessible via browser console
+         * Usage: window.jarvisVoice.test("Hello Sir, system check complete.")
+         */
+        window.jarvisVoice = {
+            test: async (text = "Hello Sir, system check complete.") => {
+                console.log('🔊 jarvisVoice.test() triggered with:', text);
+
+                // Ensure audio is enabled
+                if (!audioEnabledRef.current) {
+                    console.warn('⚠️ Audio not enabled. Click the ENABLE AUDIO button first.');
+                    return;
+                }
+
+                try {
+                    const token = localStorage.getItem('jarvis_token');
+                    if (!token) {
+                        console.error('❌ No auth token found. Please login first.');
+                        return;
+                    }
+
+                    console.log('📤 Sending TTS request...');
+                    const response = await fetch(`${API_BASE_URL}/chat`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`
+                        },
+                        body: JSON.stringify({ text })
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`Server error: ${response.status}`);
+                    }
+
+                    const contentType = response.headers.get('content-type');
+                    if (contentType && contentType.includes('audio/mpeg')) {
+                        const arrayBuffer = await response.arrayBuffer();
+                        console.log('🔊 Audio chunk received:', arrayBuffer.byteLength, 'bytes');
+
+                        const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+                        const blobUrl = URL.createObjectURL(blob);
+                        const audio = new Audio(blobUrl);
+
+                        audio.onended = () => {
+                            URL.revokeObjectURL(blobUrl);
+                            console.log('✅ Audio playback complete');
+                        };
+
+                        await audio.play();
+                        console.log('▶️ Audio playing...');
+                    } else {
+                        const data = await response.json();
+                        console.log('📝 Text response (no audio):', data);
+                    }
+                } catch (error) {
+                    console.error('❌ Voice test failed:', error);
+                }
+            },
+
+            enableAudio: () => {
+                audioEnabledRef.current = true;
+                console.log('✅ Audio enabled via jarvisVoice.enableAudio()');
+            },
+
+            status: () => {
+                return {
+                    audioEnabled: audioEnabledRef.current,
+                    hasToken: !!localStorage.getItem('jarvis_token')
+                };
+            }
+        };
+
+        console.log('🎙️ jarvisVoice debug interface loaded. Use window.jarvisVoice.test("text") to test.');
+
+        return () => {
+            delete window.jarvisVoice;
+        };
+    }, []);
+
+    // ═══════════════════════════════════════════════════════════════
+    // VOCAL LINK HANDLERS (v12.2)
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Handle incoming transcripts from VoiceHandler
+     * Creates typing effect for streaming text
+     */
+    const handleVocalTranscript = useCallback((transcript) => {
+        const { role, content, partial } = transcript;
+
+        if (role === 'assistant') {
+            if (partial) {
+                // Streaming: update or create streaming message
+                if (!streamingMessageIdRef.current) {
+                    streamingMessageIdRef.current = Date.now();
+                    setMessages(prev => [...prev, {
+                        id: streamingMessageIdRef.current,
+                        role: 'assistant',
+                        content: content,
+                        timestamp: new Date(),
+                        streaming: true
+                    }]);
+                } else {
+                    // Update existing streaming message (typing effect)
+                    setMessages(prev => prev.map(msg =>
+                        msg.id === streamingMessageIdRef.current
+                            ? { ...msg, content: msg.content + content }
+                            : msg
+                    ));
+                }
+            } else {
+                // Final transcript - finalize streaming message
+                if (streamingMessageIdRef.current) {
+                    setMessages(prev => prev.map(msg =>
+                        msg.id === streamingMessageIdRef.current
+                            ? { ...msg, content, streaming: false }
+                            : msg
+                    ));
+                    streamingMessageIdRef.current = null;
+                } else {
+                    // Direct final message
+                    setMessages(prev => [...prev, {
+                        id: Date.now(),
+                        role: 'assistant',
+                        content,
+                        timestamp: new Date()
+                    }]);
+                }
+            }
+        } else if (role === 'user') {
+            // User's transcribed speech
+            setMessages(prev => [...prev, {
+                id: Date.now(),
+                role: 'user',
+                content,
+                timestamp: new Date()
+            }]);
+        }
+    }, []);
+
+    /**
+     * Handle VoiceHandler status changes
+     * Syncs HUD indicators with realtime audio state
+     */
+    const handleVocalStatusChange = useCallback((status) => {
+        setVocalLinkStatus(status);
+        setIsListening(status.isListening);
+        setIsSpeaking(status.isSpeaking);
+
+        // Simulate audio intensity for Arc Reactor visualization
+        if (status.isSpeaking) {
+            setAudioIntensity(Math.random() * 0.5 + 0.5); // 0.5-1.0
+        } else {
+            setAudioIntensity(0);
+        }
+    }, []);
+
+    /**
+     * Send barge-in cancel event when user starts speaking
+     * Makes conversation feel natural by interrupting AI
+     */
+    const handleBargeIn = useCallback(() => {
+        if (isSpeaking && voiceHandlerRef.current?.sendCancel) {
+            console.log('🛑 Barge-in: Canceling AI response');
+            voiceHandlerRef.current.sendCancel();
+            setIsSpeaking(false);
+
+            // Clear any streaming message
+            if (streamingMessageIdRef.current) {
+                setMessages(prev => prev.map(msg =>
+                    msg.id === streamingMessageIdRef.current
+                        ? { ...msg, content: msg.content + ' [interrupted]', streaming: false }
+                        : msg
+                ));
+                streamingMessageIdRef.current = null;
+            }
+        }
+    }, [isSpeaking]);
+
+    // Trigger barge-in when user starts listening while AI is speaking
+    useEffect(() => {
+        if (isListening && isSpeaking) {
+            handleBargeIn();
+        }
+    }, [isListening, isSpeaking, handleBargeIn]);
 
     // ═══════════════════════════════════════════════════════════════
     // AUDIO EVENT MANAGEMENT
@@ -244,6 +451,7 @@ const Dashboard = ({ user, onLogout }) => {
 
             // Process audio blob
             const arrayBuffer = await response.arrayBuffer();
+            console.log('🔊 Audio chunk received:', arrayBuffer.byteLength, 'bytes');
             const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
             const blobUrl = URL.createObjectURL(blob);
             blobUrlRef.current = blobUrl;
@@ -299,6 +507,25 @@ const Dashboard = ({ user, onLogout }) => {
             }
         }
     };
+
+    /**
+     * Enable audio context - must be called on user interaction
+     * This satisfies browser autoplay policy requirements
+     */
+    const enableAudio = useCallback(() => {
+        audioEnabledRef.current = true;
+        setAudioEnabled(true); // Update state to trigger re-render
+        setAutoplayBlocked(false);
+        console.log('✅ Audio enabled by user interaction');
+
+        // Resume any suspended AudioContext
+        if (window.AudioContext || window.webkitAudioContext) {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            if (ctx.state === 'suspended') {
+                ctx.resume();
+            }
+        }
+    }, []);
 
     const handleKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -384,8 +611,22 @@ const Dashboard = ({ user, onLogout }) => {
                     <span className="text-lg font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-500 tracking-[0.3em]">J.A.R.V.I.S</span>
                 </div>
 
-                {/* Right - Clock & Logout */}
-                <div className="flex items-center gap-6">
+                {/* Right - Clock, Audio Enable & Logout */}
+                <div className="flex items-center gap-4">
+                    {/* ENABLE AUDIO Button - Red until enabled */}
+                    <button
+                        onClick={enableAudio}
+                        className={`px-4 py-2 text-xs uppercase tracking-wider rounded font-bold transition-all duration-300 flex items-center gap-2 ${audioEnabled
+                            ? 'border border-green-500/50 text-green-400 bg-green-500/10 shadow-[0_0_10px_rgba(74,222,128,0.3)]'
+                            : 'border-2 border-red-500 text-red-400 bg-red-500/20 shadow-[0_0_15px_rgba(239,68,68,0.4)] animate-pulse hover:bg-red-500/30'
+                            }`}
+                    >
+                        <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                        </svg>
+                        {audioEnabled ? 'AUDIO ON' : 'ENABLE AUDIO'}
+                    </button>
+
                     <div className="text-right">
                         <div className="text-2xl text-cyan-400 tracking-[0.15em] font-bold shadow-[0_0_20px_rgba(34,211,238,0.3)]">
                             {formatTime(currentTime)}
@@ -488,6 +729,63 @@ const Dashboard = ({ user, onLogout }) => {
                                 <span className="text-gray-400">Mic {isListening ? 'Active' : 'Standby'}</span>
                             </div>
                         </div>
+                    </div>
+
+                    {/* ─────────────────────────────────────────────────
+                        VOCAL PROTOCOL (v12.2)
+                    ───────────────────────────────────────────────── */}
+                    <div className="mt-6 pt-4 border-t border-cyan-500/20">
+                        <h3 className="text-cyan-400/60 text-xs tracking-[0.2em] uppercase mb-4">Vocal Protocol</h3>
+
+                        {/* Toggle Button */}
+                        <button
+                            onClick={() => setVocalLinkEnabled(!vocalLinkEnabled)}
+                            className={`w-full flex items-center justify-between px-3 py-3 rounded-lg border transition-all duration-300 ${vocalLinkEnabled
+                                ? 'border-cyan-400/60 bg-cyan-500/10 shadow-[0_0_15px_rgba(34,211,238,0.3)]'
+                                : 'border-cyan-500/20 bg-gray-800/50 hover:border-cyan-500/40'
+                                }`}
+                        >
+                            <div className="flex items-center gap-2">
+                                <div className={`w-3 h-3 rounded-full transition-all duration-300 ${vocalLinkEnabled
+                                    ? 'bg-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.8)] animate-pulse'
+                                    : 'bg-gray-600'
+                                    }`} />
+                                <span className={`text-xs tracking-wider ${vocalLinkEnabled ? 'text-cyan-400' : 'text-gray-400'}`}>
+                                    {vocalLinkEnabled ? 'ACTIVE' : 'STANDBY'}
+                                </span>
+                            </div>
+                            <span className="text-[10px] text-cyan-500/50 tracking-wider">
+                                {vocalLinkEnabled ? 'v12.2' : 'INIT'}
+                            </span>
+                        </button>
+
+                        {/* Vocal Link Status */}
+                        {vocalLinkEnabled && vocalLinkStatus && (
+                            <div className="mt-3 space-y-2 text-xs">
+                                <div className="flex justify-between">
+                                    <span className="text-gray-500">Connection</span>
+                                    <span className={vocalLinkStatus.isConnected ? 'text-green-400' : 'text-red-400'}>
+                                        {vocalLinkStatus.connectionStatus?.toUpperCase() || 'UNKNOWN'}
+                                    </span>
+                                </div>
+                                {vocalLinkStatus.error && (
+                                    <div className="text-red-400/80 text-[10px]">
+                                        ⚠ {vocalLinkStatus.error}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {/* Hidden VoiceHandler - mounts when enabled */}
+                        {vocalLinkEnabled && (
+                            <div className="hidden">
+                                <VoiceHandler
+                                    ref={voiceHandlerRef}
+                                    onTranscript={handleVocalTranscript}
+                                    onStatusChange={handleVocalStatusChange}
+                                />
+                            </div>
+                        )}
                     </div>
                 </aside>
 

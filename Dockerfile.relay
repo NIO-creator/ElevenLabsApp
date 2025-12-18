@@ -1,0 +1,51 @@
+# =============================================================================
+# OpenAI + ElevenLabs Relay Server - Cloud Run WebSocket Dockerfile
+# Optimized for long-lived WebSocket connections
+# =============================================================================
+
+# Stage 1: Dependencies
+FROM node:18-slim AS deps
+
+WORKDIR /app
+
+# Copy only package files for efficient caching
+COPY package*.json ./
+
+# Install production dependencies only
+RUN npm ci --only=production --ignore-scripts && \
+    npm cache clean --force
+
+# Stage 2: Production
+FROM node:18-slim AS production
+
+# Security: Run as non-root user
+RUN groupadd -r nodejs && useradd -r -g nodejs nodejs
+
+WORKDIR /app
+
+# Copy dependencies from builder stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy application files
+COPY relay-server.js ./
+COPY package.json ./
+
+# Set ownership
+RUN chown -R nodejs:nodejs /app
+
+# Switch to non-root user
+USER nodejs
+
+# Cloud Run injects PORT (defaults to 8080)
+ENV PORT=8080
+ENV NODE_ENV=production
+
+# Expose the port
+EXPOSE 8080
+
+# Health check for Cloud Run (WebSocket server responds to TCP)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD node -e "require('net').connect(process.env.PORT || 8080, 'localhost', () => process.exit(0)).on('error', () => process.exit(1))"
+
+# Start the relay server
+CMD ["node", "relay-server.js"]
