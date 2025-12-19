@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { API_CONFIG, tokenManager, authFetch } from './config';
 import VoiceHandler from './VoiceHandler';
+import MicRecorder from './MicRecorder';
 
 /**
  * Dashboard Component - Iron Man HUD Interface (v12.2 Vocal Link)
@@ -13,8 +14,8 @@ import VoiceHandler from './VoiceHandler';
  * @param {Function} onLogout - Callback to handle user logout
  */
 
-// WebSocket Relay Server for Realtime Audio
-const RELAY_SERVER_URL = 'wss://elevenlabs-relay-794024916030.europe-west1.run.app';
+// WebSocket Relay Server for Realtime Audio (v12.9.2 Raw Handshake Debug)
+const RELAY_SERVER_URL = 'wss://v12-9-2---jarvis-relay-794024916030.europe-west1.run.app';
 
 // Production API Base URL from centralized config
 const API_BASE_URL = API_CONFIG.BASE_URL;
@@ -910,6 +911,27 @@ const Dashboard = ({ user, onLogout }) => {
                                 <span className="text-green-400">12ms</span>
                             </div>
                         </div>
+                    </div>
+
+                    {/* ─────────────────────────────────────────────────
+                        STT PROTOCOL (v13.2)
+                    ───────────────────────────────────────────────── */}
+                    <div className="mt-6 pt-4 border-t border-cyan-500/20">
+                        <h3 className="text-cyan-400/60 text-xs tracking-[0.2em] uppercase mb-4">STT Protocol</h3>
+                        <MicRecorder
+                            mode="hold"
+                            onTranscript={(data) => {
+                                // Add user's transcribed speech to messages
+                                setMessages(prev => [...prev, {
+                                    id: Date.now(),
+                                    role: 'user',
+                                    content: data.text,
+                                    timestamp: new Date(),
+                                    provider: data.provider,
+                                    failover: data.failover
+                                }]);
+                            }}
+                        />
                     </div>
                 </aside>
             </main>

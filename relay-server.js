@@ -44,17 +44,131 @@ if (!ELEVENLABS_API_KEY) {
     process.exit(1);
 }
 
+// ==================== DIAGNOSTIC CONFIGURATION (v12.9.3) ====================
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase();
+const DIAG_HANDSHAKE = process.env.DIAG_HANDSHAKE === 'true';
+const IS_DEBUG = LOG_LEVEL === 'debug' || DIAG_HANDSHAKE;
+
+// Safe header allowlist for logging (no auth tokens)
+const SAFE_HEADERS_ALLOWLIST = [
+    'content-type',
+    'content-length',
+    'x-request-id',
+    'x-ratelimit-limit-requests',
+    'x-ratelimit-remaining-requests',
+    'x-ratelimit-reset-requests',
+    'retry-after',
+    'date',
+    'server'
+];
+
+/**
+ * Redact sensitive values from strings
+ * @param {string} str - String to redact
+ * @returns {string} - Redacted string
+ */
+function redactSecrets(str) {
+    if (typeof str !== 'string') return str;
+    // Redact Bearer tokens, API keys, and common secret patterns
+    return str
+        .replace(/Bearer\s+[A-Za-z0-9\-_\.]+/gi, 'Bearer [REDACTED]')
+        .replace(/sk-[A-Za-z0-9\-_]{20,}/g, 'sk-[REDACTED]')
+        .replace(/xi_[A-Za-z0-9\-_]{20,}/g, 'xi_[REDACTED]')
+        .replace(/"api_key"\s*:\s*"[^"]+"/gi, '"api_key": "[REDACTED]"')
+        .replace(/"xi_api_key"\s*:\s*"[^"]+"/gi, '"xi_api_key": "[REDACTED]"')
+        .replace(/"authorization"\s*:\s*"[^"]+"/gi, '"authorization": "[REDACTED]"');
+}
+
+/**
+ * Extract safe headers only (no auth headers)
+ * @param {Object} headers - Headers object
+ * @returns {Object} - Filtered headers
+ */
+function getSafeHeaders(headers) {
+    if (!headers) return {};
+    const safe = {};
+    for (const key of SAFE_HEADERS_ALLOWLIST) {
+        if (headers[key]) {
+            safe[key] = headers[key];
+        }
+    }
+    return safe;
+}
+
+/**
+ * Structured diagnostic log with connection ID
+ * @param {string} level - 'info', 'debug', 'warn', 'error'
+ * @param {string} connId - Connection UUID
+ * @param {string} event - Event name
+ * @param {Object} data - Additional data (optional)
+ */
+function diagLog(level, connId, event, data = null) {
+    // Skip debug logs unless in debug/diag mode
+    if (level === 'debug' && !IS_DEBUG) return;
+
+    const timestamp = new Date().toISOString();
+    const prefix = `[${timestamp}] [${connId}]`;
+    const emoji = {
+        info: 'ℹ️',
+        debug: '🔬',
+        warn: '⚠️',
+        error: '❌'
+    }[level] || '📋';
+
+    let message = `${emoji} ${prefix} ${event}`;
+    if (data) {
+        const safeData = redactSecrets(JSON.stringify(data));
+        message += ` ${safeData}`;
+    }
+
+    if (level === 'error') {
+        console.error(message);
+    } else if (level === 'warn') {
+        console.warn(message);
+    } else {
+        console.log(message);
+    }
+}
+
+// ==================== TRANSCRIPTION CONFIGURATION (Sprint 13.0) ====================
+const TRANSCRIPTION_ENABLED = process.env.TRANSCRIPTION_ENABLED === 'true';
+const MAX_AUDIO_BYTES = parseInt(process.env.MAX_AUDIO_BYTES) || 5242880; // 5MB
+const MAX_AUDIO_SECONDS = parseInt(process.env.MAX_AUDIO_SECONDS) || 30;
+const TRANSCRIPTION_MODEL = process.env.TRANSCRIPTION_MODEL || 'whisper-1';
+
 // Create WebSocket server for frontend connections
 const wss = new WebSocket.Server({ port: PORT });
 
-console.log(`\n🚀 OpenAI + ElevenLabs Relay Server v12.1`);
+console.log(`\n🚀 OpenAI + ElevenLabs Relay Server v13.0 (WHISPER INTEGRATION)`);
 console.log(`📡 Listening on ws://localhost:${PORT}`);
 console.log(`🔗 OpenAI: ${OPENAI_REALTIME_URL}`);
-console.log(`🎤 ElevenLabs Voice: ${ELEVENLABS_VOICE_ID} (J.A.R.V.I.S.)\n`);
+console.log(`🎤 ElevenLabs Voice: ${ELEVENLABS_VOICE_ID} (J.A.R.V.I.S.)`);
+console.log(`🔧 Diagnostics: LOG_LEVEL=${LOG_LEVEL}, DIAG_HANDSHAKE=${DIAG_HANDSHAKE}`);
+console.log(`🎙️ Transcription: enabled=${TRANSCRIPTION_ENABLED}, model=${TRANSCRIPTION_MODEL}, maxBytes=${MAX_AUDIO_BYTES}, maxSec=${MAX_AUDIO_SECONDS}\n`);
 
 wss.on('connection', (clientWs, req) => {
-    const sessionId = uuidv4();
-    console.log(`✅ [${sessionId}] Frontend connected from ${req.socket.remoteAddress}`);
+    // Generate unique connection ID for forensic tracing
+    const connId = uuidv4();
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+
+    // Log client connection with safe origin info
+    diagLog('info', connId, 'CLIENT_CONNECT', {
+        ip: clientIp,
+        origin: req.headers.origin || 'none',
+        userAgent: req.headers['user-agent']?.substring(0, 50) || 'none'
+    });
+
+    // Send conn_id to client for correlation (when DIAG_HANDSHAKE enabled)
+    if (DIAG_HANDSHAKE) {
+        clientWs.send(JSON.stringify({
+            type: 'diag.conn_id',
+            conn_id: connId
+        }));
+        diagLog('debug', connId, 'DIAG_CONN_ID_SENT');
+    }
+
+    // Legacy alias for backward compatibility in logs
+    const sessionId = connId;
 
     let openaiWs = null;
     let elevenLabsWs = null;
@@ -62,6 +176,257 @@ wss.on('connection', (clientWs, req) => {
     let elevenLabsConnected = false;
     let currentResponseId = null;
     let textBuffer = '';
+    let isResponsePending = false; // Prevent double-triggers
+    let isReady = false;           // Auth-First guard - only process audio after session.created
+
+    // ==================== TRANSCRIPTION STATE MACHINE (Sprint 13.0) ====================
+    // States: 'idle' -> 'recording' -> 'processing' -> 'idle'
+    let transcriptionState = {
+        status: 'idle',           // 'idle', 'recording', 'processing'
+        audioChunks: [],          // Buffer for audio chunks
+        totalBytes: 0,            // Running total of bytes received
+        startTime: null,          // When recording started (for duration cap)
+        format: null,             // Audio format metadata
+        sampleRate: null,
+        encoding: null
+    };
+
+    /**
+     * Reset transcription state and free buffers
+     */
+    function resetTranscriptionState() {
+        transcriptionState = {
+            status: 'idle',
+            audioChunks: [],
+            totalBytes: 0,
+            startTime: null,
+            format: null,
+            sampleRate: null,
+            encoding: null
+        };
+        diagLog('debug', connId, 'TRANSCRIPTION_STATE_RESET');
+    }
+
+    /**
+     * Send transcript error to client
+     */
+    function sendTranscriptError(code, message) {
+        const errorPayload = {
+            type: 'transcript.error',
+            code,
+            message
+        };
+        if (DIAG_HANDSHAKE) {
+            errorPayload.conn_id = connId;
+        }
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify(errorPayload));
+        }
+        diagLog('warn', connId, 'TRANSCRIPT_ERROR', { code, message });
+    }
+
+    /**
+     * Send transcript final to client
+     * @param {string} text - Transcribed text
+     * @param {number} durationMs - Recording duration
+     * @param {string} provider - Provider used (openai, elevenlabs)
+     * @param {boolean} failover - Whether failover was triggered
+     */
+    function sendTranscriptFinal(text, durationMs, provider = 'openai', failover = false) {
+        const payload = {
+            type: 'transcript.final',
+            text,
+            duration_ms: durationMs,
+            provider
+        };
+        if (failover) {
+            payload.failover = true;
+        }
+        if (DIAG_HANDSHAKE) {
+            payload.conn_id = connId;
+        }
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify(payload));
+        }
+        diagLog('info', connId, 'TRANSCRIPT_FINAL', { text: text.substring(0, 50) + '...', duration_ms: durationMs });
+    }
+
+    /**
+     * Process collected audio through STT provider (with failover)
+     * Sprint 13.1 - Uses provider orchestrator
+     */
+    async function processTranscription() {
+        if (transcriptionState.audioChunks.length === 0) {
+            sendTranscriptError('no_audio', 'No audio data received');
+            resetTranscriptionState();
+            return;
+        }
+
+        transcriptionState.status = 'processing';
+        diagLog('info', connId, 'TRANSCRIPTION_PROCESSING', {
+            totalBytes: transcriptionState.totalBytes,
+            chunks: transcriptionState.audioChunks.length
+        });
+
+        try {
+            // Combine all audio chunks into a single buffer
+            const audioBuffer = Buffer.concat(transcriptionState.audioChunks);
+
+            // Calculate recording duration
+            const recordingDuration = transcriptionState.startTime
+                ? Date.now() - transcriptionState.startTime
+                : 0;
+
+            // Use provider orchestrator with failover (Sprint 13.1)
+            const sttOrchestrator = require('./transcription');
+            const logFn = (event, data) => diagLog('info', connId, event, data);
+
+            const result = await sttOrchestrator.transcribe(
+                audioBuffer,
+                transcriptionState.format,
+                logFn
+            );
+
+            sendTranscriptFinal(
+                result.text,
+                recordingDuration,
+                result.provider,
+                result.failover || false
+            );
+            resetTranscriptionState();
+
+        } catch (error) {
+            diagLog('error', connId, 'TRANSCRIPTION_EXCEPTION', {
+                error: error.message,
+                status: error.status,
+                provider: error.provider
+            });
+
+            // Determine error code based on status
+            let errorCode = 'internal_error';
+            if (error.status === 429) errorCode = 'rate_limited';
+            else if (error.status === 401 || error.status === 403) errorCode = 'auth_error';
+            else if (error.status >= 500) errorCode = 'server_error';
+
+            sendTranscriptError(errorCode, error.message);
+            resetTranscriptionState();
+        }
+    }
+
+    /**
+     * Handle audio.start message
+     */
+    function handleAudioStart(payload) {
+        if (!TRANSCRIPTION_ENABLED) {
+            sendTranscriptError('disabled', 'Transcription is not enabled on this server');
+            return;
+        }
+
+        if (transcriptionState.status !== 'idle') {
+            sendTranscriptError('invalid_state', 'audio.start received while already recording. Send audio.end first.');
+            return;
+        }
+
+        transcriptionState.status = 'recording';
+        transcriptionState.audioChunks = [];
+        transcriptionState.totalBytes = 0;
+        transcriptionState.startTime = Date.now();
+        transcriptionState.format = payload.format || 'webm';
+        transcriptionState.sampleRate = payload.sampleRate || 16000;
+        transcriptionState.encoding = payload.encoding || 'opus';
+
+        diagLog('info', connId, 'AUDIO_START', {
+            format: transcriptionState.format,
+            sampleRate: transcriptionState.sampleRate,
+            encoding: transcriptionState.encoding
+        });
+
+        // Acknowledge start
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: 'audio.started' }));
+        }
+    }
+
+    /**
+     * Handle audio.chunk message
+     */
+    function handleAudioChunk(payload) {
+        if (!TRANSCRIPTION_ENABLED) {
+            sendTranscriptError('disabled', 'Transcription is not enabled');
+            return;
+        }
+
+        if (transcriptionState.status !== 'recording') {
+            sendTranscriptError('invalid_state', 'audio.chunk received without audio.start');
+            return;
+        }
+
+        if (!payload.data) {
+            sendTranscriptError('invalid_payload', 'audio.chunk missing data field');
+            return;
+        }
+
+        // Decode base64 audio chunk
+        const chunk = Buffer.from(payload.data, 'base64');
+        const newTotalBytes = transcriptionState.totalBytes + chunk.length;
+
+        // Check size limit
+        if (newTotalBytes > MAX_AUDIO_BYTES) {
+            sendTranscriptError('audio_too_large', `Audio exceeds ${MAX_AUDIO_BYTES} byte limit`);
+            resetTranscriptionState();
+            return;
+        }
+
+        // Check duration limit
+        const elapsedSeconds = (Date.now() - transcriptionState.startTime) / 1000;
+        if (elapsedSeconds > MAX_AUDIO_SECONDS) {
+            sendTranscriptError('audio_too_long', `Audio exceeds ${MAX_AUDIO_SECONDS} second limit`);
+            resetTranscriptionState();
+            return;
+        }
+
+        transcriptionState.audioChunks.push(chunk);
+        transcriptionState.totalBytes = newTotalBytes;
+
+        diagLog('debug', connId, 'AUDIO_CHUNK', {
+            chunkSize: chunk.length,
+            totalBytes: newTotalBytes,
+            elapsedSec: elapsedSeconds.toFixed(1)
+        });
+    }
+
+    /**
+     * Handle audio.end message
+     */
+    function handleAudioEnd() {
+        if (!TRANSCRIPTION_ENABLED) {
+            sendTranscriptError('disabled', 'Transcription is not enabled');
+            return;
+        }
+
+        if (transcriptionState.status !== 'recording') {
+            sendTranscriptError('invalid_state', 'audio.end received without audio.start');
+            return;
+        }
+
+        // Check duration limit one more time
+        const elapsedSeconds = (Date.now() - transcriptionState.startTime) / 1000;
+        if (elapsedSeconds > MAX_AUDIO_SECONDS) {
+            sendTranscriptError('audio_too_long', `Audio exceeds ${MAX_AUDIO_SECONDS} second limit`);
+            resetTranscriptionState();
+            return;
+        }
+
+        diagLog('info', connId, 'AUDIO_END', {
+            totalBytes: transcriptionState.totalBytes,
+            chunks: transcriptionState.audioChunks.length,
+            durationSec: elapsedSeconds.toFixed(2)
+        });
+
+        // Process the transcription
+        processTranscription();
+    }
+
 
     // ==================== LATENCY BENCHMARKING ====================
     let latencyMetrics = {
@@ -160,6 +525,14 @@ wss.on('connection', (clientWs, req) => {
                         latencyMetrics.isFirstAudioDelta = false;
                         console.log(`🎤 [${sessionId}] T3: First audio delta received`);
                         logLatencyReport();
+
+                        // Sprint 14.0: Signal TTS start to client
+                        if (clientWs.readyState === WebSocket.OPEN) {
+                            clientWs.send(JSON.stringify({
+                                type: 'tts.start',
+                                response_id: currentResponseId
+                            }));
+                        }
                     }
 
                     // Forward audio to frontend as response.audio.delta
@@ -210,13 +583,17 @@ wss.on('connection', (clientWs, req) => {
     }
 
     function sendTextToElevenLabs(text) {
+        // Diagnostic: Log ElevenLabs connection state
+        console.log(`🔬 [DIAG] [${sessionId}] sendTextToElevenLabs called - connected: ${elevenLabsConnected}, readyState: ${elevenLabsWs?.readyState}, text: "${text.substring(0, 30)}..."`);
+
         if (!elevenLabsConnected || elevenLabsWs.readyState !== WebSocket.OPEN) {
-            console.warn(`⚠️ [${sessionId}] ElevenLabs not connected, buffering text`);
+            console.warn(`⚠️ [${sessionId}] ElevenLabs not connected (state: ${elevenLabsWs?.readyState}), buffering text. Buffer size: ${textBuffer.length}`);
             textBuffer += text;
             return;
         }
 
         // Send text chunk to ElevenLabs
+        console.log(`📨 [${sessionId}] Sending to ElevenLabs: "${text.substring(0, 50)}..."`);
         elevenLabsWs.send(JSON.stringify({ text: text }));
     }
 
@@ -263,61 +640,164 @@ Operational Guidelines:
 
     openaiWs.on('open', () => {
         openaiConnected = true;
-        console.log(`🔗 [${sessionId}] Connected to OpenAI Realtime API`);
+        diagLog('info', connId, 'OPENAI_SOCKET_OPEN', { waiting: 'session.created' });
+        // NOTE: Do NOT send session.update here - wait for session.created first
+    });
 
-        // Send session.update with J.A.R.V.I.S. persona and tuned VAD
-        const sessionUpdate = {
-            type: 'session.update',
-            session: {
-                modalities: ['text'], // Text only - we use ElevenLabs for audio
-                instructions: JARVIS_SYSTEM_INSTRUCTIONS,
-                voice: 'alloy', // Required field but won't be used
-                input_audio_format: 'pcm16',
-                output_audio_format: 'pcm16',
-                turn_detection: {
-                    type: 'server_vad',
-                    threshold: 0.5,           // Filter background noise
-                    prefix_padding_ms: 300,
-                    silence_duration_ms: 600  // Natural breathing room
-                }
+    // ==================== FORENSIC SOCKET LOGGING (v12.9.3) ====================
+    openaiWs.on('unexpected-response', (request, response) => {
+        const safeHeaders = getSafeHeaders(response.headers);
+
+        diagLog('error', connId, 'OPENAI_UNEXPECTED_RESPONSE', {
+            statusCode: response.statusCode,
+            statusMessage: response.statusMessage || 'none',
+            headers: safeHeaders
+        });
+
+        let body = '';
+        response.on('data', chunk => body += chunk);
+        response.on('end', () => {
+            // Bound body to 500 chars and redact any secrets
+            const boundedBody = body.length > 500 ? body.substring(0, 500) + '...[TRUNCATED]' : body;
+            const safeBody = redactSecrets(boundedBody);
+
+            diagLog('error', connId, 'OPENAI_RESPONSE_BODY', { body: safeBody });
+
+            // Categorized hints for common errors
+            if (response.statusCode === 401) {
+                diagLog('warn', connId, 'AUTH_HINT', { hint: 'Invalid OPENAI_API_KEY - check Secret Manager binding' });
+            } else if (response.statusCode === 403) {
+                diagLog('warn', connId, 'AUTH_HINT', { hint: 'API key lacks Realtime API access' });
+            } else if (response.statusCode === 429) {
+                diagLog('warn', connId, 'RATE_LIMIT_HINT', { hint: 'Rate limited - too many requests' });
             }
-        };
-        openaiWs.send(JSON.stringify(sessionUpdate));
-        console.log(`🛡️ J.A.R.V.I.S. Protocol Engaged: Persona Locked`);
-        console.log(`⚙️ [${sessionId}] VAD tuned: threshold=0.5, silence=600ms`);
+        });
+    });
 
-        // Connect to ElevenLabs for voice synthesis
-        connectToElevenLabs();
+    openaiWs.on('close', (code, reason) => {
+        openaiConnected = false;
+        isReady = false;
+        const reasonStr = reason ? reason.toString() : 'none';
+        diagLog('info', connId, 'OPENAI_SOCKET_CLOSE', { code, reason: reasonStr });
     });
 
     openaiWs.on('message', (data) => {
         try {
             const message = JSON.parse(data.toString());
 
-            // Log important events
+            // ==================== EVENT SPY - LOG ALL OPENAI EVENTS (debug mode only) ====================
+            const eventType = message.type || 'unknown';
+            const isError = eventType === 'error';
+            const isTextDelta = eventType.includes('text') || eventType.includes('transcript');
+            const isAudioEvent = eventType.includes('audio');
+            const isResponseEvent = eventType.includes('response');
+
+            // Color-coded spy log (only in debug mode)
+            if (IS_DEBUG) {
+                if (isError) {
+                    diagLog('error', connId, `SPY_ERROR: ${eventType}`, message.error);
+                } else if (isTextDelta) {
+                    diagLog('debug', connId, `SPY_TEXT: ${eventType}`, { delta: message.delta?.substring(0, 50) });
+                } else if (isResponseEvent) {
+                    diagLog('debug', connId, `SPY_RESPONSE: ${eventType}`);
+                } else if (isAudioEvent) {
+                    diagLog('debug', connId, `SPY_AUDIO: ${eventType}`);
+                } else {
+                    diagLog('debug', connId, `SPY_EVENT: ${eventType}`);
+                }
+            }
+            // ===========================================================================
+
+            // Log important events and Auth-First validation
             if (message.type === 'session.created') {
-                console.log(`🎉 [${sessionId}] OpenAI session created:`, message.session?.id || 'unknown');
+                isReady = true;
+                const openaiSessionId = message.session?.id || 'unknown';
+                diagLog('info', connId, 'HANDSHAKE_SESSION_CREATED', { openaiSessionId });
+
+                // Forward session.created to client (for harness detection)
+                if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({
+                        type: 'session.created',
+                        session: { id: openaiSessionId }
+                    }));
+                }
+
+                // NOW send session.update after session.created is confirmed
+                diagLog('debug', connId, 'HANDSHAKE_SENDING_UPDATE');
+                const sessionUpdate = {
+                    type: 'session.update',
+                    session: {
+                        modalities: ['text'],
+                        instructions: JARVIS_SYSTEM_INSTRUCTIONS,
+                        voice: 'alloy',
+                        input_audio_format: 'pcm16',
+                        output_audio_format: 'pcm16',
+                        turn_detection: {
+                            type: 'server_vad',
+                            threshold: 0.5,
+                            prefix_padding_ms: 300,
+                            silence_duration_ms: 600,
+                            create_response: false
+                        },
+                        input_audio_transcription: {
+                            model: 'whisper-1'
+                        }
+                    }
+                };
+                openaiWs.send(JSON.stringify(sessionUpdate));
+                diagLog('info', connId, 'HANDSHAKE_UPDATE_SENT');
+
+                // Connect to ElevenLabs for voice synthesis
+                connectToElevenLabs();
+
             } else if (message.type === 'session.updated') {
-                console.log(`⚙️ [${sessionId}] OpenAI session updated`);
+                diagLog('info', connId, 'HANDSHAKE_SESSION_UPDATED');
+
+                // Forward session.updated to client (for harness detection)
+                if (clientWs.readyState === WebSocket.OPEN) {
+                    clientWs.send(JSON.stringify({
+                        type: 'session.updated'
+                    }));
+                }
             } else if (message.type === 'error') {
-                console.error(`❌ [${sessionId}] OpenAI error:`, message.error);
+                diagLog('error', connId, 'OPENAI_ERROR', { error: message.error });
             }
 
-            // T1: Speech stopped - user finished speaking - VOCAL HANDSHAKE TRIGGER
+            // Log user transcription when Whisper completes
+            if (message.type === 'conversation.item.input_audio_transcription.completed') {
+                const transcript = message.transcript || '';
+                console.log(`🟢 [TRANSCRIPT] [${sessionId}] User said: "${transcript}"`);
+            }
+
+            // T1: Speech stopped - user finished speaking - PASSIVE HANDSHAKE (v12.7)
+            // Let OpenAI VAD handle the buffer natively, we only trigger the response
             if (message.type === 'input_audio_buffer.speech_stopped') {
                 resetLatencyTracking();
                 latencyMetrics.t1SpeechStopped = process.hrtime();
-                console.log(`🎙️ [${sessionId}] Speech ended. Forcing J.A.R.V.I.S. response...`);
 
-                // Immediately trigger response generation
-                openaiWs.send(JSON.stringify({
-                    type: 'response.create',
-                    response: {
-                        modalities: ['text'],
-                        instructions: JARVIS_SYSTEM_INSTRUCTIONS // Re-affirm persona
-                    }
-                }));
-                console.log(`📤 Triggering Response [${sessionId}]`);
+                // Prevent double-triggers if response is already being generated
+                if (isResponsePending) {
+                    console.log(`⏸️ [${sessionId}] Response already pending, skipping trigger`);
+                } else {
+                    console.log(`🎙️ [${sessionId}] Speech ended (VAD). Triggering J.A.R.V.I.S. response...`);
+                    isResponsePending = true;
+
+                    // Trigger response generation (no manual commit - VAD handles buffer)
+                    openaiWs.send(JSON.stringify({
+                        type: 'response.create',
+                        response: {
+                            modalities: ['text'],
+                            instructions: JARVIS_SYSTEM_INSTRUCTIONS
+                        }
+                    }));
+                    console.log(`📤 Triggering Response [${sessionId}]`);
+                }
+            }
+
+            // Reset pending flag when response completes
+            if (message.type === 'response.done') {
+                isResponsePending = false;
+                console.log(`✅ [${sessionId}] Response complete, ready for next turn`);
             }
 
             // Intercept text responses for ElevenLabs
@@ -378,7 +858,8 @@ Operational Guidelines:
     });
 
     openaiWs.on('error', (error) => {
-        console.error(`❌ [${sessionId}] OpenAI error:`, error.message);
+        diagLog('error', connId, 'OPENAI_SOCKET_ERROR', { message: error.message });
+        diagLog('warn', connId, 'AUTH_HINT', { hint: 'Check if OPENAI_API_KEY is valid and Secret Manager is bound' });
 
         if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({
@@ -390,7 +871,8 @@ Operational Guidelines:
 
     openaiWs.on('close', (code, reason) => {
         openaiConnected = false;
-        console.log(`🔌 [${sessionId}] OpenAI disconnected: ${code}`);
+        const reasonStr = reason ? reason.toString() : 'none';
+        diagLog('info', connId, 'OPENAI_DISCONNECT', { code, reason: reasonStr });
 
         if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.close(1000, 'OpenAI connection closed');
@@ -400,22 +882,74 @@ Operational Guidelines:
     // ==================== Frontend Event Handlers ====================
 
     clientWs.on('message', (data) => {
-        if (!openaiConnected || openaiWs.readyState !== WebSocket.OPEN) {
-            console.warn(`⚠️ [${sessionId}] Cannot forward - OpenAI not connected`);
-            return;
-        }
-
         try {
             const message = JSON.parse(data.toString());
-            console.log(`📤 [${sessionId}] Relaying to OpenAI:`, message.type || 'unknown');
+
+            // ==================== TRANSCRIPTION MESSAGE ROUTING (Sprint 13.0) ====================
+            // Handle audio.* messages for transcription - these don't require OpenAI session
+            if (message.type === 'audio.start') {
+                handleAudioStart(message);
+                return;
+            }
+            if (message.type === 'audio.chunk') {
+                handleAudioChunk(message);
+                return;
+            }
+            if (message.type === 'audio.end') {
+                handleAudioEnd();
+                return;
+            }
+            // ====================================================================================
+
+            // ==================== TTS STOP HANDLER (Sprint 14.0) ====================
+            // Handle tts.stop from client - best-effort cancellation
+            if (message.type === 'tts.stop') {
+                console.log(`🛑 [${sessionId}] Client requested TTS stop`);
+                // Close and reconnect ElevenLabs to stop current generation
+                if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+                    elevenLabsWs.close();
+                    // Reconnect for next request
+                    setTimeout(() => connectToElevenLabs(), 100);
+                }
+                return;
+            }
+            // ====================================================================================
+
+            // Auth-First Guard: Block OpenAI relay until session is validated
+            if (!isReady) {
+                diagLog('warn', connId, 'CLIENT_MESSAGE_BLOCKED', { reason: 'session_not_ready', type: message.type });
+                return;
+            }
+
+            if (!openaiConnected || openaiWs.readyState !== WebSocket.OPEN) {
+                diagLog('warn', connId, 'CLIENT_MESSAGE_BLOCKED', { reason: 'openai_not_connected', type: message.type });
+                return;
+            }
+
+            diagLog('debug', connId, 'CLIENT_MESSAGE_RELAY', { type: message.type || 'unknown' });
             openaiWs.send(data.toString());
         } catch (err) {
-            openaiWs.send(data.toString());
+            // Non-JSON message - forward to OpenAI if ready
+            if (isReady && openaiConnected && openaiWs.readyState === WebSocket.OPEN) {
+                openaiWs.send(data.toString());
+            }
         }
     });
 
     clientWs.on('close', (code, reason) => {
-        console.log(`👋 [${sessionId}] Frontend disconnected: ${code}`);
+        const reasonStr = reason ? reason.toString() : 'none';
+        diagLog('info', connId, 'CLIENT_DISCONNECT', { code, reason: reasonStr });
+
+        // ==================== TRANSCRIPTION CLEANUP (Sprint 13.0) ====================
+        // Always free transcription buffers on disconnect to prevent memory leaks
+        if (transcriptionState.status !== 'idle') {
+            diagLog('info', connId, 'TRANSCRIPTION_CLEANUP_ON_DISCONNECT', {
+                status: transcriptionState.status,
+                bytesFreed: transcriptionState.totalBytes
+            });
+        }
+        resetTranscriptionState();
+        // ====================================================================================
 
         if (openaiWs && openaiWs.readyState === WebSocket.OPEN) {
             openaiWs.close();
@@ -426,7 +960,7 @@ Operational Guidelines:
     });
 
     clientWs.on('error', (error) => {
-        console.error(`❌ [${sessionId}] Frontend error:`, error.message);
+        diagLog('error', connId, 'CLIENT_SOCKET_ERROR', { message: error.message });
     });
 });
 

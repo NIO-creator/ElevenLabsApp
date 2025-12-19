@@ -1,18 +1,20 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * VoiceHandler.js - Realtime Audio Capture & Playback (v12.0)
+ * VoiceHandler.js - Realtime Audio Capture & Playback (v14.0 - MSE Streaming)
  * ═══════════════════════════════════════════════════════════════════════════
  * 
  * Handles bidirectional audio streaming with OpenAI's Realtime API via
  * a local WebSocket relay server. Features:
  * - 24kHz mono microphone capture
  * - PCM16 Base64 encoding for transmission
- * - Real-time audio playback via Web Audio API
+ * - MSE-based MP3 streaming playback (Sprint 14.0)
+ * - Mute/Stop playback controls
  * - J.A.R.V.I.S. persona injection
  * - Server VAD turn detection
  */
 
 import React, { useState, useRef, useCallback, useEffect, forwardRef, useImperativeHandle } from 'react';
+import StreamingAudioPlayer from './StreamingAudioPlayer';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONFIGURATION
@@ -105,6 +107,7 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
     const [isConnected, setIsConnected] = useState(false);
     const [isListening, setIsListening] = useState(false);
     const [isSpeaking, setIsSpeaking] = useState(false);
+    const [isMuted, setIsMuted] = useState(false);
     const [error, setError] = useState(null);
     const [connectionStatus, setConnectionStatus] = useState('disconnected');
 
@@ -116,8 +119,8 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
     const mediaStreamRef = useRef(null);
     const processorRef = useRef(null);
     const sourceNodeRef = useRef(null);
-    const playbackQueueRef = useRef([]);
-    const isPlayingRef = useRef(false);
+    const streamingPlayerRef = useRef(null);  // Sprint 14.0 - MSE streaming player
+    const currentResponseIdRef = useRef(null);
 
     // ─────────────────────────────────────────────────────────────────────────
     // AUDIO CONTEXT INITIALIZATION
@@ -138,48 +141,69 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
     }, []);
 
     // ─────────────────────────────────────────────────────────────────────────
-    // AUDIO PLAYBACK (Web Audio API)
+    // STREAMING AUDIO PLAYBACK (MSE - Sprint 14.0)
     // ─────────────────────────────────────────────────────────────────────────
-    const playAudioChunk = useCallback((float32Data) => {
-        const ctx = audioContextRef.current;
-        if (!ctx) return;
 
-        // Create audio buffer
-        const audioBuffer = ctx.createBuffer(CHANNELS, float32Data.length, SAMPLE_RATE);
-        audioBuffer.copyToChannel(float32Data, 0);
-
-        // Create buffer source
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-
-        source.onended = () => {
-            // Play next chunk in queue
-            if (playbackQueueRef.current.length > 0) {
-                const nextChunk = playbackQueueRef.current.shift();
-                playAudioChunk(nextChunk);
-            } else {
-                isPlayingRef.current = false;
-                setIsSpeaking(false);
-            }
-        };
-
-        source.start();
-        isPlayingRef.current = true;
-        setIsSpeaking(true);
+    /**
+     * Handle streaming player state changes
+     */
+    const handlePlayerStateChange = useCallback((state) => {
+        setIsSpeaking(state.isPlaying || state.isStreaming);
+        setIsMuted(state.isMuted);
+        if (state.error) {
+            console.warn('⚠️ [VoiceHandler] Streaming player error:', state.error);
+        }
     }, []);
 
-    const queueAudioForPlayback = useCallback((base64Audio) => {
-        const float32Data = base64ToFloat32Array(base64Audio);
-
-        if (isPlayingRef.current) {
-            // Queue if already playing
-            playbackQueueRef.current.push(float32Data);
+    /**
+     * Queue audio chunk for MSE streaming playback
+     * @param {string} base64Mp3 - Base64 encoded MP3 chunk
+     */
+    const queueAudioForPlayback = useCallback((base64Mp3) => {
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.appendChunk(base64Mp3);
         } else {
-            // Start playback immediately
-            playAudioChunk(float32Data);
+            console.warn('⚠️ [VoiceHandler] StreamingAudioPlayer not initialized');
         }
-    }, [playAudioChunk]);
+    }, []);
+
+    /**
+     * End the current audio stream
+     */
+    const endAudioStream = useCallback(() => {
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.endStream();
+        }
+    }, []);
+
+    /**
+     * Stop playback and send tts.stop to server
+     */
+    const stopPlayback = useCallback(() => {
+        // Stop client-side immediately
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.stop();
+        }
+        setIsSpeaking(false);
+
+        // Send tts.stop to server (best-effort)
+        if (wsRef.current?.readyState === WebSocket.OPEN && currentResponseIdRef.current) {
+            wsRef.current.send(JSON.stringify({
+                type: 'tts.stop',
+                response_id: currentResponseIdRef.current
+            }));
+            console.log('🛑 [VoiceHandler] Sent tts.stop to server');
+        }
+    }, []);
+
+    /**
+     * Toggle mute state
+     */
+    const toggleMute = useCallback(() => {
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.toggleMute();
+        }
+    }, []);
 
     // ─────────────────────────────────────────────────────────────────────────
     // WEBSOCKET MESSAGE HANDLER
@@ -198,15 +222,30 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
                     console.log('🔧 Session updated');
                     break;
 
+                // Sprint 14.0 - TTS streaming events
+                case 'tts.start':
+                    console.log('🎤 [VoiceHandler] TTS stream started:', data.response_id);
+                    currentResponseIdRef.current = data.response_id;
+                    break;
+
                 case 'response.audio.delta':
-                    // Received audio chunk from AI - queue for playback
+                    // Received MP3 chunk from ElevenLabs - stream for playback
                     if (data.delta) {
+                        currentResponseIdRef.current = data.response_id;
                         queueAudioForPlayback(data.delta);
                     }
                     break;
 
+                case 'tts.end':
                 case 'response.audio.done':
-                    console.log('🔊 Audio response complete');
+                    console.log('🔊 [VoiceHandler] Audio stream complete');
+                    endAudioStream();
+                    currentResponseIdRef.current = null;
+                    break;
+
+                case 'tts.error':
+                    console.error('❌ [VoiceHandler] TTS error:', data.code, data.message);
+                    setError(data.message || 'TTS error');
                     break;
 
                 case 'response.audio_transcript.delta':
@@ -424,9 +463,10 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
             wsRef.current = null;
         }
 
-        // Clear playback queue
-        playbackQueueRef.current = [];
-        isPlayingRef.current = false;
+        // Stop streaming playback
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.stop();
+        }
 
         setIsConnected(false);
         setIsSpeaking(false);
@@ -442,11 +482,12 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
                 isConnected,
                 isListening,
                 isSpeaking,
+                isMuted,
                 connectionStatus,
                 error,
             });
         }
-    }, [isConnected, isListening, isSpeaking, connectionStatus, error, onStatusChange]);
+    }, [isConnected, isListening, isSpeaking, isMuted, connectionStatus, error, onStatusChange]);
 
     // ─────────────────────────────────────────────────────────────────────────────
     // BARGE-IN: SEND CANCEL EVENT (v12.2)
@@ -461,9 +502,10 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
         wsRef.current.send(JSON.stringify(cancelEvent));
         console.log('🛑 Sent response.cancel (barge-in)');
 
-        // Clear playback queue
-        playbackQueueRef.current = [];
-        isPlayingRef.current = false;
+        // Stop streaming playback
+        if (streamingPlayerRef.current) {
+            streamingPlayerRef.current.stop();
+        }
         setIsSpeaking(false);
     }, []);
 
@@ -474,7 +516,10 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
         sendCancel,
         connect,
         disconnect,
-    }), [sendCancel, connect, disconnect]);
+        stopPlayback,
+        toggleMute,
+        isMuted: () => isMuted,
+    }), [sendCancel, connect, disconnect, stopPlayback, toggleMute, isMuted]);
 
     // ─────────────────────────────────────────────────────────────────────────────
     // AUTO-CONNECT ON MOUNT (when autoConnect prop is true)
@@ -502,6 +547,13 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
     // ─────────────────────────────────────────────────────────────────────────
     return (
         <div className="voice-handler">
+            {/* Streaming Audio Player (hidden - handles MSE playback) */}
+            <StreamingAudioPlayer
+                ref={streamingPlayerRef}
+                onStateChange={handlePlayerStateChange}
+                onError={(e) => console.error('❌ StreamingAudioPlayer error:', e)}
+            />
+
             {/* Connection Controls */}
             <div className="flex items-center gap-4">
                 {!isConnected ? (
@@ -513,13 +565,48 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
                         <span>Initialize Voice Link</span>
                     </button>
                 ) : (
-                    <button
-                        onClick={disconnect}
-                        className="px-6 py-3 border border-red-500/50 text-red-400 hover:bg-red-500/10 font-bold rounded-lg transition-all duration-300 flex items-center gap-2"
-                    >
-                        <div className="w-3 h-3 rounded-full bg-red-500" />
-                        <span>Disconnect</span>
-                    </button>
+                    <>
+                        <button
+                            onClick={disconnect}
+                            className="px-6 py-3 border border-red-500/50 text-red-400 hover:bg-red-500/10 font-bold rounded-lg transition-all duration-300 flex items-center gap-2"
+                        >
+                            <div className="w-3 h-3 rounded-full bg-red-500" />
+                            <span>Disconnect</span>
+                        </button>
+
+                        {/* Mute Button */}
+                        <button
+                            onClick={toggleMute}
+                            className={`px-4 py-2 rounded-lg transition-all duration-300 flex items-center gap-2 ${isMuted
+                                ? 'border border-yellow-500/50 text-yellow-400 bg-yellow-500/10'
+                                : 'border border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/10'}`}
+                            title={isMuted ? 'Unmute' : 'Mute'}
+                        >
+                            {isMuted ? (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.796 8.796 0 0021 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.99 8.99 0 003.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" />
+                                </svg>
+                            ) : (
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
+                                </svg>
+                            )}
+                        </button>
+
+                        {/* Stop Button (visible when speaking) */}
+                        {isSpeaking && (
+                            <button
+                                onClick={stopPlayback}
+                                className="px-4 py-2 border border-red-500/50 text-red-400 hover:bg-red-500/20 rounded-lg transition-all duration-300 flex items-center gap-2"
+                                title="Stop Playback"
+                            >
+                                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M6 6h12v12H6z" />
+                                </svg>
+                                <span>Stop</span>
+                            </button>
+                        )}
+                    </>
                 )}
 
                 {/* Status Indicators */}
@@ -540,6 +627,13 @@ const VoiceHandler = forwardRef(({ onTranscript, onStatusChange, autoConnect = t
                         <div className="flex items-center gap-2 text-yellow-400">
                             <div className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse shadow-[0_0_8px_rgba(250,204,21,0.8)]" />
                             <span>SPEAKING</span>
+                        </div>
+                    )}
+
+                    {isMuted && (
+                        <div className="flex items-center gap-2 text-yellow-500">
+                            <div className="w-2 h-2 rounded-full bg-yellow-500" />
+                            <span>MUTED</span>
                         </div>
                     )}
                 </div>

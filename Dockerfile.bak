@@ -28,7 +28,6 @@ COPY --from=deps /app/node_modules ./node_modules
 
 # Copy application files
 COPY relay-server.js ./
-COPY transcription/ ./transcription/
 COPY package.json ./
 
 # Set ownership

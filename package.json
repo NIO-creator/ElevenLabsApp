@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "relay": "node relay-server.js"
+    "relay": "node relay-server.js",
+    "smoke": "node scripts/ws-smoke.js",
+    "smoke:local": "node scripts/ws-smoke.js --url ws://localhost:8081 --n 10",
+    "smoke:diag": "cross-env DIAG_HANDSHAKE=true node scripts/ws-smoke.js --url ws://localhost:8081 --n 5"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +22,7 @@
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
+    "form-data": "^4.0.5",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.8.0",
