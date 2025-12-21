@@ -209,23 +209,27 @@ async function getLastSessionTranscript(userId, excludeSessionId = null) {
     );
 
     // Sprint 14.2.8.6: Bounded retry for commit visibility race
-    // If prior session exists but has no messages, retry once after 100ms
-    // This covers the window where Session A's final message hasn't committed yet
-    let retryOccurred = false;
-    if (messagesResult.rows.length === 0) {
-        console.log(`⏳ [MEMORY] getLastSessionTranscript: Prior session ${lastSessionHash} found but empty, retry in 100ms...`);
-        await new Promise(r => setTimeout(r, 100));
+    // If prior session exists but has no messages, retry up to 2 times with 150ms delay
+    // This covers the window where Session A's messages/endSession haven't committed yet
+    // Total max delay: 300ms (2 * 150ms)
+    let retryCount = 0;
+    const MAX_RETRIES = 2;
+    const RETRY_DELAY_MS = 150;
+
+    while (messagesResult.rows.length === 0 && retryCount < MAX_RETRIES) {
+        retryCount++;
+        console.log(`⏳ [MEMORY] getLastSessionTranscript: Prior session ${lastSessionHash} empty, retry ${retryCount}/${MAX_RETRIES} in ${RETRY_DELAY_MS}ms...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
 
         messagesResult = await db.query(
             `SELECT id, role, content, metadata, created_at
              FROM messages WHERE session_id = $1 ORDER BY created_at`,
             [lastSessionId]
         );
-        retryOccurred = true;
     }
 
     const msgCount = messagesResult.rows.length;
-    console.log(`🔍 [MEMORY] getLastSessionTranscript: user=${userIdHash} session=${lastSessionHash} messages=${msgCount} retry=${retryOccurred}`);
+    console.log(`🔍 [MEMORY] getLastSessionTranscript: user=${userIdHash} session=${lastSessionHash} messages=${msgCount} retries=${retryCount}`);
 
     return messagesResult.rows;
 }
